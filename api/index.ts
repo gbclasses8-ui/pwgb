@@ -103,11 +103,38 @@ function handleProxy(req: express.Request, res: express.Response, overridePath?:
   const targetPath = overridePath || resolvePath(req);
   const targetUrl = new URL(targetPath, TARGET_ORIGIN);
 
+  // Construct intelligent Referer header
+  let refererHeader = `${TARGET_ORIGIN}/`;
+  const incomingReferer = (req.headers['referer'] as string) || '';
+
+  if (incomingReferer) {
+    try {
+      const u = new URL(incomingReferer);
+      u.protocol = 'https:';
+      u.host = TARGET_HOST;
+      refererHeader = u.toString();
+    } catch {
+      refererHeader = `${TARGET_ORIGIN}/`;
+    }
+  }
+
+  // Critical requirement: /api/video-url requires exact watch path referer with query params
+  if (targetPath.startsWith('/api/video-url')) {
+    const q = targetUrl.searchParams;
+    const batchId = q.get('batch_id') || q.get('batchId') || '';
+    const subjectId = q.get('subject_id') || q.get('subjectId') || '';
+    const videoId = q.get('video_id') || q.get('videoId') || q.get('childId') || '';
+    refererHeader = `${TARGET_ORIGIN}/watch?batchId=${batchId}&SubjectId=${subjectId}&ContentId=${videoId}`;
+  }
+
   const forwardHeaders: http.OutgoingHttpHeaders = {
     ...req.headers,
     host: TARGET_HOST,
     origin: TARGET_ORIGIN,
-    referer: `${TARGET_ORIGIN}/`,
+    referer: refererHeader,
+    'user-agent':
+      (req.headers['user-agent'] as string) ||
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   };
 
   // Strip hop-by-hop headers
@@ -115,6 +142,18 @@ function handleProxy(req: express.Request, res: express.Response, overridePath?:
   delete forwardHeaders['keep-alive'];
   delete forwardHeaders['transfer-encoding'];
   delete forwardHeaders['x-matched-path'];
+
+  // Check if this request is a video stream, manifest, DRM OTP, or media segment
+  // These MUST bypass any string buffering/transformation for instantaneous playback
+  const isDirectMedia =
+    targetPath.startsWith('/api/play') ||
+    targetPath.startsWith('/api/get-otp') ||
+    targetPath.startsWith('/api/video-url') ||
+    targetPath.startsWith('/api/Schedule') ||
+    targetPath.includes('.mpd') ||
+    targetPath.includes('.m3u8') ||
+    targetPath.includes('.m4s') ||
+    targetPath.includes('.mp4');
 
   const proxyReq = https.request(
     targetUrl,
@@ -130,6 +169,11 @@ function handleProxy(req: express.Request, res: express.Response, overridePath?:
       delete headers['x-frame-options'];
       delete headers['content-security-policy'];
       delete headers['content-security-policy-report-only'];
+
+      // Allow CORS from any origin for media & API requests
+      headers['access-control-allow-origin'] = '*';
+      headers['access-control-allow-methods'] = 'GET, POST, OPTIONS, HEAD';
+      headers['access-control-allow-headers'] = '*';
 
       // Rewrite cookies to work without strict domain pinning
       if (headers['set-cookie']) {
@@ -150,17 +194,20 @@ function handleProxy(req: express.Request, res: express.Response, overridePath?:
       }
 
       const contentType = (headers['content-type'] || '').toLowerCase();
+
+      // Only transform UI text (HTML, RSC components, search/batch listings, static scripts)
+      // Never transform video streams, manifests, or media chunks!
       const isText =
-        contentType.includes('text/') ||
-        contentType.includes('application/json') ||
-        contentType.includes('application/javascript') ||
-        contentType.includes('text/javascript') ||
-        contentType.includes('application/x-javascript') ||
-        contentType.includes('text/x-component') ||
-        contentType.includes('xml');
+        !isDirectMedia &&
+        (contentType.includes('text/html') ||
+          contentType.includes('application/x-javascript') ||
+          contentType.includes('application/javascript') ||
+          contentType.includes('text/javascript') ||
+          contentType.includes('text/x-component') ||
+          (contentType.includes('application/json') && !targetPath.startsWith('/api/play')));
 
       if (!isText) {
-        // Stream binary responses directly (videos, audio, images, fonts, pdfs)
+        // Stream binary responses and media segments directly at maximum wire speed
         res.writeHead(statusCode, headers);
         proxyRes.pipe(res);
         return;
